@@ -1892,7 +1892,7 @@ def gui_input():
             files_to_download=eth_files_to_dl,
             dest_value=dest_value,
             subfolder="eth_v2",
-            decompress_zst=True,
+            decompress_zst=False,
             error_label="Eth",
         )
 
