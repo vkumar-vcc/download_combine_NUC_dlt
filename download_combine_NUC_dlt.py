@@ -31,6 +31,9 @@ BASE_URL = (
     "https://sys34e8eca5.blob.core.windows.net/raw-archive-storage/data_nuc/public"
 )
 DEST = r"C:\workspace\logs\NUC_DLT_downloads"
+NETWORK_ROOT = Path(
+    r"\\gotgnmtas02.got.volvocars.net\9413-SHR-TAS-NUC_STORAGE\data_nuc\public"
+)
 
 # Default values (will be overridden by CLI or GUI)
 VIN = "YV13ZNBV4V1001060"
@@ -196,8 +199,74 @@ def get_blob_client():
 # ---------------------------
 
 
+def list_network_files(category, target_date, ecu=None):
+    folder = NETWORK_ROOT / VIN / category
+    if ecu is not None:
+        folder /= ecu
+    folder = folder / target_date.strftime("%Y/%m/%d")
+    files = []
+    try:
+        for path in sorted(folder.iterdir()):
+            if not path.is_file():
+                continue
+            name_lower = path.name.lower()
+            if category == "DLT" and not name_lower.endswith(".dlt.zst"):
+                continue
+            if category == "eth_v2" and ".pcap" not in name_lower:
+                continue
+            if category == "UART" and not name_lower.endswith((".log", ".txt", ".raw")):
+                continue
+            timestamp = parse_file_timestamp_from_name(path.name)
+            if timestamp is None:
+                if category == "DLT":
+                    continue
+            elif not START_DT <= timestamp <= END_DT:
+                continue
+            file_info = {"name": path.name, "blob_path": str(path), "source": "network"}
+            if ecu is not None:
+                file_info["ecu"] = ecu
+            files.append(file_info)
+    except OSError as error:
+        log(f"Network lookup unavailable for {folder}: {error}; trying Azure")
+        return []
+    if files:
+        log(f"Found {len(files)} network file(s) in {folder}")
+    return files
+
+
+class NetworkBlob:
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def download_blob(self):
+        return self
+
+    def readall(self):
+        return self.path.read_bytes()
+
+
+def get_file_client(file_info):
+    if file_info.get("source") == "network":
+        return NetworkBlob(file_info["blob_path"])
+    blob_client = get_blob_client()
+    if not blob_client:
+        raise RuntimeError("Cannot connect to blob storage")
+    container_client = blob_client.get_container_client(CONTAINER_NAME)
+    return container_client.get_blob_client(file_info["blob_path"])
+
+
 def discover_available_ecus(vin_value):
     global _BLOB_SERVICE_CLIENT
+
+    folder = NETWORK_ROOT / vin_value / "DLT"
+    try:
+        ecus = sorted(entry.name for entry in folder.iterdir() if entry.is_dir())
+    except OSError as error:
+        log(f"Network ECU lookup unavailable: {error}; trying Azure")
+    else:
+        if ecus:
+            log(f"Found network ECUs for {vin_value}: {', '.join(ecus)}")
+            return ecus
 
     blob_client = get_blob_client()
     if not blob_client:
@@ -241,6 +310,9 @@ def discover_available_ecus(vin_value):
 
 
 def list_blob_files(ecu, target_date):
+    network_files = list_network_files("DLT", target_date, ecu=ecu)
+    if network_files:
+        return network_files
     blob_client = get_blob_client()
     if not blob_client:
         return []
@@ -309,6 +381,9 @@ def collect_all_files(dest_root, progress_callback=None):
 
 
 def list_eth_blob_files(target_date):
+    network_files = list_network_files("eth_v2", target_date)
+    if network_files:
+        return network_files
     blob_client = get_blob_client()
     if not blob_client:
         return []
@@ -383,6 +458,9 @@ def collect_all_eth_files(progress_callback=None):
 
 
 def list_uart_blob_files(target_date):
+    network_files = list_network_files("UART", target_date)
+    if network_files:
+        return network_files
     blob_client = get_blob_client()
     if not blob_client:
         return []
@@ -478,15 +556,7 @@ def process_file(
         progress_callback("start", file, idx, total)
 
     try:
-        blob_client = get_blob_client()
-        if not blob_client:
-            log(f"[DL] FAILED {file['name']} - Cannot connect to blob storage")
-            if progress_callback:
-                progress_callback("failed", file, idx, total)
-            return False
-
-        container_client = blob_client.get_container_client(CONTAINER_NAME)
-        blob_client_file = container_client.get_blob_client(file["blob_path"])
+        blob_client_file = get_file_client(file)
 
         with open(local_zst, "wb") as f:
             download_stream = blob_client_file.download_blob()
@@ -711,13 +781,7 @@ def download_selected_blob_files(
 
         log(f"[UART] ({idx}/{total}) START {name}")
         try:
-            blob_client = get_blob_client()
-            if not blob_client:
-                log(f"[UART] ({idx}/{total}) FAILED {name} - Cannot connect to blob")
-                continue
-
-            container_client = blob_client.get_container_client(CONTAINER_NAME)
-            blob_file = container_client.get_blob_client(file_info["blob_path"])
+            blob_file = get_file_client(file_info)
             data = _download_blob_bytes(blob_file)
 
             # Write to a temp file first so a killed/interrupted run never leaves
@@ -1803,9 +1867,7 @@ def gui_input():
 
                 event_queue.put(("progress", completed, total, "start", name))
                 try:
-                    blob_client = get_blob_client()
-                    container_client = blob_client.get_container_client(CONTAINER_NAME)
-                    blob_file = container_client.get_blob_client(file_info["blob_path"])
+                    blob_file = get_file_client(file_info)
                     with open(local_path, "wb") as f:
                         f.write(blob_file.download_blob().readall())
 
@@ -1892,7 +1954,7 @@ def gui_input():
             files_to_download=eth_files_to_dl,
             dest_value=dest_value,
             subfolder="eth_v2",
-            decompress_zst=False,
+            decompress_zst=True,
             error_label="Eth",
         )
 
